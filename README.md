@@ -8,7 +8,7 @@ This SEED installs the latest production build of [Plow](https://plow.co) on mac
 
 Tell any AI agent:
 
-> Install `<this-repo's-git-url>`
+> Install `https://github.com/plow-pbc/plow-seed`
 
 ## License
 
