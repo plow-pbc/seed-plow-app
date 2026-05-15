@@ -140,9 +140,10 @@ done
 
 ## Verify
 
-1. **App bundle present.** ^v-bundle Does `/Applications/Plow.app` exist as a directory containing the `Contents/MacOS/Plow` executable? Expected: yes.
-2. **Bundle is well-formed.** ^v-plist Does `defaults read /Applications/Plow.app/Contents/Info CFBundleIdentifier` print a non-empty bundle identifier (no error)? Expected: yes.
-3. **App launches.** ^v-launch Does `open -a Plow` exit 0, and does `pgrep -x Plow` report at least one running process within 10 seconds? Expected: yes.
+1. **seedctl is functional.** ^v-seedctl Does `"${SEEDCTL:-/Applications/Seed OS Manager.app/Contents/MacOS/seedctl}" osa --stdin <<<'return 1 + 1'` exit 0 and print `2`? This is `seed-os-manager`'s own `^v-smoke` re-asserted here as this SEED's hard dep — if it fails, every Apple Event in this install will also fail. Expected: yes.
+2. **App bundle present.** ^v-bundle Does `/Applications/Plow.app` exist as a directory containing the `Contents/MacOS/Plow` executable? Expected: yes.
+3. **Bundle is well-formed.** ^v-plist Does `defaults read /Applications/Plow.app/Contents/Info CFBundleIdentifier` print a non-empty bundle identifier (no error)? Expected: yes.
+4. **App launches.** ^v-launch Does `open -a Plow` exit 0, and does `pgrep -x Plow` report at least one running process within 10 seconds? Expected: yes.
 
 ## Open
 
