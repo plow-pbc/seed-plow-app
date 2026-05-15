@@ -110,19 +110,33 @@ done
 
 ## Actions
 
+### seed-os-manager is installed first ^act-prereq
+
+- Post-order traversal of the dependency tree installs `seed-os-manager` before this SEED's own steps run, so `seedctl` is present on disk before any Apple Event in this install fires.
+- The chain is implemented inline in this SEED's install block: a guarded inlined install runs only when `$SEEDCTL` is not already executable. Re-runs are no-ops once `seed-os-manager` is installed. Future cleanup: collapse the inlined ~20 lines to `curl … | bash` once `seed-os-manager` publishes a standalone install script.
+- The inlined install deliberately omits the `/usr/local/bin/seedctl` symlink that `seed-os-manager`'s standalone install creates. That step requires `sudo` and would break the autonomous install path; `seedctl` is invoked by absolute path (`$SEEDCTL`) throughout this SEED and downstream consumers.
+- Failure to install `seed-os-manager` MUST abort this SEED's install. Without `seedctl`, the pre-warm and the quit-Plow steps cannot route through the signed TCC principal, and the install degrades to the silent `-1743` failure mode this dep was added to eliminate.
+
 ### Plow is downloaded ^act-download
 
 - `curl` fetches `https://plow.co/download`, follows the 307 redirect, and writes the response body to `$TMPDIR/Plow.dmg`. The download MUST exit non-zero on any HTTP error (`curl -f`).
 
 ### Plow.app is replaced ^act-replace
 
-- The install action MUST quit a running `Plow.app` before copying. Copying over a running bundle MAY leave a partially-replaced bundle on disk.
+- The install action MUST quit a running `Plow.app` before copying. Copying over a running bundle MAY leave a partially-replaced bundle on disk. The quit MUST be routed through `seedctl osa --stdin` (not `osascript -e` directly), because the install block runs under the agent's shell, which is not a TCC-grantable principal; raw `osascript` would silently fail with `-1743` on a fresh machine and the running Plow.app would never quit.
 - The install action MUST `rm -rf /Applications/Plow.app` before `cp -R`, so a stale build can never silently shadow the new one.
+- After the copy, the install action SHOULD strip `com.apple.quarantine` from the freshly-installed bundle (`xattr -dr com.apple.quarantine /Applications/Plow.app`). The bundle is already signed and notarized; the quarantine xattr only triggers Gatekeeper's "downloaded from Internet" dialog on first user launch, which is a friction the install can eliminate.
 
 ### Plow is launched ^act-launch
 
 - After the copy, `open -a Plow` launches the freshly-installed build.
-- macOS Gatekeeper MAY prompt on first launch of a newly-replaced bundle; subsequent launches proceed silently.
+- macOS Gatekeeper does NOT prompt on first launch when `^act-replace`'s quarantine strip has run, because the bundle no longer carries the `com.apple.quarantine` xattr that triggers the dialog.
+
+### Automation TCC is pre-warmed ^act-prewarm
+
+- Immediately after launching the new build, the install fires three dummy `seedctl osa` calls at `"Plow"`, `"Messages"`, and `"System Events"`. Each call triggers a one-time macOS Automation TCC prompt attributed to "Seed OS Manager"; the user clicks Allow once per target. Grants are durable across reboots and SEED reinstalls.
+- These three targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation, and (c) System Events is the generic AppleScript surface for keystroke/window operations. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed in v1 — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
+- Pre-warm failures are non-fatal. If the user clicks Don't Allow or the target app isn't yet running, the dummy call exits non-zero; the install continues. Downstream SEEDs that actually need the grant will re-prompt at first use.
 
 ## Verify
 
