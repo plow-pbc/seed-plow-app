@@ -8,9 +8,15 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 ## Dependencies
 
+API / per-machine state:
+
 - A Mac running macOS. Authored on macOS 26.4.1 / arm64.
 - ≥200 MB free disk (~94 MB for the `.dmg` in `$TMPDIR`, ~94 MB for the extracted bundle in `/Applications`).
-- System tools at `/usr/bin/*`: `curl`, `hdiutil`, `osascript`, `open`. No install needed.
+
+Software:
+
+- `https://github.com/plow-pbc/seed-os-manager` — installs `Seed OS Manager.app` and the `seedctl` CLI. `seedctl` is the signed, notarized TCC principal under which all Apple Events from this SEED (and from any downstream SEED that drives Plow) are attributed. macOS cannot prompt the user to grant Apple-Event Automation permissions to an unidentified shell child process, so installs that run AppleScript directly via `osascript` fail silently with `-1743` ("Not authorized to send Apple events"). Routing through `seedctl` fixes this; therefore `seed-os-manager` MUST be installed before this SEED's install block runs.
+- System tools at `/usr/bin/*`: `curl`, `hdiutil`, `open`, `xattr`. No install needed.
 
 Run the following block to install Plow. The block is idempotent: re-running re-downloads the current `https://plow.co/download` artifact and replaces the installed bundle.
 
