@@ -53,12 +53,21 @@ if [ ! -x "$SEEDCTL" ]; then
   SOM_MOUNT=$(mktemp -d -t som-dmg)
   hdiutil attach -nobrowse -readonly -mountpoint "$SOM_MOUNT" "$SOM_DMG" >/dev/null
   [ -d "$SOM_MOUNT/Seed OS Manager.app" ] || { echo "Seed OS Manager.app not found inside DMG at $SOM_MOUNT" >&2; exit 1; }
-  # Verify signature + Gatekeeper assessment on the DMG'd bundle BEFORE we
-  # execute it. The downloaded .dmg is the system boundary; trusting only TLS +
+  # Verify signature + Gatekeeper assessment + EXACT bundle identity before
+  # executing. The downloaded .dmg is the system boundary; trusting only TLS +
   # macOS's first-launch Gatekeeper isn't enough here because we strip the
   # quarantine xattr later, which skips Gatekeeper's first-launch check.
+  # codesign --verify proves the signature is intact; spctl --assess proves
+  # macOS accepts the bundle as notarized; the Identifier + TeamIdentifier
+  # grep proves the bundle is *this product*, not some other Apple-signed
+  # app shaped like Seed OS Manager.app.
   codesign --verify --deep --strict --verbose=0 "$SOM_MOUNT/Seed OS Manager.app"
   spctl --assess --type execute "$SOM_MOUNT/Seed OS Manager.app"
+  SOM_META=$(codesign -d --verbose=2 "$SOM_MOUNT/Seed OS Manager.app" 2>&1)
+  echo "$SOM_META" | grep -qx 'Identifier=co.plow.seed-os-manager' \
+    || { echo "Seed OS Manager.app: Identifier mismatch (expected co.plow.seed-os-manager)" >&2; exit 1; }
+  echo "$SOM_META" | grep -qx 'TeamIdentifier=3559PD337Z' \
+    || { echo "Seed OS Manager.app: TeamIdentifier mismatch (expected 3559PD337Z)" >&2; exit 1; }
   rm -rf "$SOM_APP"
   # ditto (not cp -R): BSD cp -R nests source-into-existing-dest, producing
   # /Applications/Seed OS Manager.app/Seed OS Manager.app on retry. Mirrors
@@ -106,22 +115,32 @@ PLOW_MOUNT=$(mktemp -d -t plow-dmg)
 hdiutil attach -nobrowse -readonly -mountpoint "$PLOW_MOUNT" "$DMG" >/dev/null
 [ -d "$PLOW_MOUNT/Plow.app" ] || { echo "Plow.app not found inside DMG at $PLOW_MOUNT" >&2; exit 1; }
 
-# 4. Verify signature + Gatekeeper assessment on the DMG-mounted Plow.app
-#    BEFORE we copy and strip quarantine. The xattr strip at step 6 bypasses
+# 4. Verify signature + Gatekeeper assessment + EXACT bundle identity BEFORE
+#    we copy and strip quarantine. The xattr strip at step 6 bypasses
 #    first-launch Gatekeeper; this step is the only point we get to enforce
-#    local notarization + signing checks on the downloaded bundle.
+#    local notarization + signing checks on the downloaded bundle. The
+#    Identifier + TeamIdentifier grep proves the bundle is *this product*,
+#    not just any Apple-signed app shaped like Plow.app.
 codesign --verify --deep --strict --verbose=0 "$PLOW_MOUNT/Plow.app"
 spctl --assess --type execute "$PLOW_MOUNT/Plow.app"
+PLOW_META=$(codesign -d --verbose=2 "$PLOW_MOUNT/Plow.app" 2>&1)
+echo "$PLOW_META" | grep -qx 'Identifier=co.plow.app' \
+  || { echo "Plow.app: Identifier mismatch (expected co.plow.app)" >&2; exit 1; }
+echo "$PLOW_META" | grep -qx 'TeamIdentifier=KLP7XF8JXJ' \
+  || { echo "Plow.app: TeamIdentifier mismatch (expected KLP7XF8JXJ)" >&2; exit 1; }
 
 # 5. Replace /Applications/Plow.app. ditto (not cp -R) for the same reason as
 #    the seed-os-manager copy above.
 rm -rf /Applications/Plow.app
 ditto "$PLOW_MOUNT/Plow.app" /Applications/Plow.app
 
-# 6. Strip quarantine so Gatekeeper does not show the "downloaded from Internet"
-#    dialog on first user launch. Safe to skip Gatekeeper here because step 4
-#    already verified the bundle's signature + Gatekeeper acceptance locally.
-xattr -dr com.apple.quarantine /Applications/Plow.app
+# 6. Clear extended attributes so Gatekeeper does not show the "downloaded
+#    from Internet" dialog on first user launch. xattr -cr (clear-recursive)
+#    is used instead of `xattr -dr com.apple.quarantine` because the latter
+#    exits non-zero under set -e on the already-clean-bundle case (idempotent
+#    re-runs). Safe to broad-clear here because step 4 already verified the
+#    bundle's signature + Gatekeeper acceptance locally.
+xattr -cr /Applications/Plow.app
 
 # 7. Launch the new build.
 open -a Plow
@@ -169,9 +188,9 @@ done
 
 - The install action MUST quit BOTH a running `Plow.app` AND any bundled `plowd` process before copying. `plowd` lives under `/Applications/Plow.app/...`; `rm -rf`'ing the bundle while `plowd` is still executing from it would leave a zombie running deleted-on-disk code until the next reboot. The quit pattern mirrors `cncorp/plow`'s `install-latest-production-build.sh`: routed quit first (lets the app save state), `pkill -x Plow` and `pkill -f '/Applications/Plow\.app/.*plowd\.main:app'` as backstops, then re-check both processes are gone before continuing.
 - The routed quit MUST go through `seedctl osa --stdin` (not `osascript -e` directly), because the install block runs under the agent's shell, which is not a TCC-grantable principal; raw `osascript` would silently fail with `-1743` on a fresh machine and the running Plow.app would never quit.
-- Before copying, the install action MUST verify the DMG-mounted bundle with `codesign --verify --deep --strict` and `spctl --assess --type execute`. This is the only point at which the bundle's signature and Gatekeeper acceptance get checked locally — the quarantine-strip in the next step bypasses first-launch Gatekeeper, so without these checks a compromised downloaded `.dmg` could reach execution without ever being verified.
+- Before copying, the install action MUST verify the DMG-mounted bundle with (a) `codesign --verify --deep --strict` (signature is intact), (b) `spctl --assess --type execute` (macOS accepts the bundle as notarized), AND (c) `codesign -d --verbose=2` parsed for an exact `Identifier=` and `TeamIdentifier=` match (the bundle is *this product*, not just any other notarized Apple-signed app shaped like Plow.app). Pinned values: Plow.app → `Identifier=co.plow.app` + `TeamIdentifier=KLP7XF8JXJ`; Seed OS Manager.app → `Identifier=co.plow.seed-os-manager` + `TeamIdentifier=3559PD337Z`. This is the only point at which the bundle's identity gets enforced locally — the xattr clear in the next step bypasses first-launch Gatekeeper.
 - The install action MUST `rm -rf /Applications/Plow.app` before `ditto`, so a stale build can never silently shadow the new one. `ditto` (not `cp -R`) prevents BSD `cp -R`'s nesting bug: `cp -R src/Plow.app /Applications/` would produce `/Applications/Plow.app/Plow.app/` when the destination already exists.
-- After the copy, the install action SHOULD strip `com.apple.quarantine` from the freshly-installed bundle (`xattr -dr com.apple.quarantine /Applications/Plow.app`). The bundle is already signed and notarized and was verified locally in the prior step; the quarantine xattr only triggers Gatekeeper's "downloaded from Internet" dialog on first user launch, which is a friction the install can eliminate.
+- After the copy, the install action clears extended attributes on the freshly-installed bundle with `xattr -cr /Applications/Plow.app`. The bundle is already signed and notarized and was verified locally in the prior step; clearing xattrs strips `com.apple.quarantine` (which would otherwise trigger Gatekeeper's "downloaded from Internet" dialog on first user launch) while remaining idempotent on retry — `xattr -dr com.apple.quarantine` exits non-zero under `set -e` when the xattr is already absent.
 
 ### Plow is launched ^act-launch
 
