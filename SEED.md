@@ -92,6 +92,8 @@ fi
 SEEDCTL_BUNDLE="$(cd "$(dirname "$SEEDCTL")/../.." && pwd)"
 codesign --verify --deep --strict --verbose=0 "$SEEDCTL_BUNDLE" \
   || { echo "$SEEDCTL_BUNDLE: codesign verify failed — refusing to drive Apple Events through it" >&2; exit 1; }
+spctl --assess --type execute "$SEEDCTL_BUNDLE" \
+  || { echo "$SEEDCTL_BUNDLE: Gatekeeper/notarization assessment failed — refusing to drive Apple Events through it" >&2; exit 1; }
 SEEDCTL_META=$(codesign -d --verbose=2 "$SEEDCTL_BUNDLE" 2>&1)
 echo "$SEEDCTL_META" | grep -qx 'Identifier=co.plow.seed-os-manager' \
   || { echo "$SEEDCTL_BUNDLE: Identifier mismatch (expected co.plow.seed-os-manager). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
@@ -209,6 +211,25 @@ done
 if [ -s "$TOKEN_FILE" ] && [ "$(stat -f '%Lp' "$TOKEN_FILE")" = "600" ]; then
   echo "Plow already activated (token present at $TOKEN_FILE). Skipping activation." >&2
 else
+  # 9aa. Tell the operator to start activation in Plow's installer
+  #      window. Plow.app's InstallerView initializes started=false
+  #      and prepareActivationIfNeeded() returns before
+  #      startActivation() fires; on a fresh launch nothing reaches
+  #      /v1/activate (and so nothing writes the 'Activation created'
+  #      line we poll for) until the operator clicks the Start /
+  #      Activate / Begin button in Plow's UI. We don't automate the
+  #      click — driving Plow's UI via System Events would
+  #      re-introduce the fragile UI-scrape surface this SEED
+  #      deliberately avoided. The 120s 9b window below covers the
+  #      operator's click-then-watch round-trip.
+  echo "" >&2
+  echo "Plow.app should now be showing its installer / activation window." >&2
+  echo "  → Click 'Start' (or 'Activate' / 'Begin') in Plow's UI now to" >&2
+  echo "    trigger activation. Once you click, Plow writes the activation" >&2
+  echo "    code to its log; this install picks it up automatically and" >&2
+  echo "    drives Messages.app to send the iMessage for you." >&2
+  echo "" >&2
+
   # 9b. Wait for Plow.app to write a NEW activation code to the app
   #     log. Polling (not tail -F) — app.log can be replaced on app
   #     upgrade. The `|| true` keeps a grep no-match (the common case
@@ -243,7 +264,7 @@ else
   echo "Please type that number in E.164 form (e.g. +14155551234), then press Enter:" >&2
   read -r SEND_TO </dev/tty
   echo "$SEND_TO" | grep -Eq '^\+[0-9]{10,15}$' \
-    || { echo "send-TO not in E.164 form (expected +<10-15 digits>): '$SEND_TO'" >&2; exit 1; }
+    || { echo "send-TO not in E.164 form (expected +<10-15 digits>); please re-run and re-type the number" >&2; exit 1; }
 
   # 9d. Drive Messages.app via seedctl. Step 8 already pre-warmed the
   #     Messages TCC grant so this won't prompt. iMessage service
@@ -324,7 +345,7 @@ fi
 
 ### Plow is activated ^act-activate
 
-- After [`^act-prewarm`](#^act-prewarm), the install reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
+- After [`^act-prewarm`](#^act-prewarm), the install surfaces a one-line instruction telling the operator to click Start / Activate / Begin in Plow.app's installer window — Plow's `InstallerView` initializes with `started=false`, so `prepareActivationIfNeeded()` never reaches `startActivation()` until the operator clicks. The install then reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
 - Two 120-second polls (60 × 2s each): one for the `app.log` `Activation created` line, one for the token file. Either timing out aborts the install. Downstream SEEDs that POST to plowd's local API require `^v-activated`; silent partial-activation would surface as a mid-flight crash in those SEEDs — exactly the failure class this Action exists to eliminate.
 - The Messages.app `send` AppleScript MUST be routed through `seedctl osa --stdin` (the heredoc on stdin keeps the activation code off argv). It MUST be sent over the iMessage service explicitly (`first service whose service type = iMessage`); Plow's activation line is iMessage-only and an SMS-defaulted send would silently fail server-side even though Messages.app shows it as delivered.
 - The `send_to` prompt is the only operator input this Action collects. The operator's iMessage identity on this Mac is the implicit send-FROM (whatever Messages.app has configured); no SEED-side handle prompt is needed.
