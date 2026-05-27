@@ -200,23 +200,32 @@ else
   #     UI displays. Tier-3 per the SEED convention — only the operator
   #     can see the UI; we don't UI-scrape in v1. Read via /dev/tty so
   #     the prompt works even when the SEED is piped via `seed install`.
+  #     E.164 validation guards the AppleScript heredoc below — without
+  #     it a value containing quotes could break out under seedctl's
+  #     already-warmed Messages TCC principal.
   echo "" >&2
   echo "Plow's activation screen shows a number to text the code to." >&2
-  echo "Please type that number (e.g. +1XXXXXXXXXX), then press Enter:" >&2
+  echo "Please type that number in E.164 form (e.g. +14155551234), then press Enter:" >&2
   read -r SEND_TO </dev/tty
   [ -n "$SEND_TO" ] || { echo "no send-TO number supplied — aborting" >&2; exit 1; }
+  echo "$SEND_TO" | grep -Eq '^\+[0-9]{10,15}$' \
+    || { echo "send-TO not in E.164 form (expected +<10-15 digits>): $SEND_TO" >&2; exit 1; }
 
   # 9d. Drive Messages.app via seedctl. Step 8 already pre-warmed the
   #     Messages TCC grant so this won't prompt. iMessage service
   #     explicitly — Plow's activation line is iMessage-only; an
   #     SMS-defaulted send to a green-bubble peer would silently fail
   #     server-side. The code+number pass via stdin (heredoc) — never on
-  #     argv (last-3-chars policy applies to argv visibility too).
+  #     argv (last-3-chars policy applies to argv visibility too). The
+  #     'Plow Activate: ' prefix is required by the production inbound
+  #     parser (api/plow/channels/linq/routes/webhook.py matches on
+  #     '^Plow Activate:\s*(\S+)'); the bare code alone never matches
+  #     and the operator times out waiting for plow-api-token.
   "$SEEDCTL" osa --stdin <<OSA
 tell application "Messages"
   set theService to first service whose service type = iMessage
   set theBuddy to participant "$SEND_TO" of theService
-  send "$ACTIVATION_CODE" to theBuddy
+  send "Plow Activate: $ACTIVATION_CODE" to theBuddy
 end tell
 OSA
 
