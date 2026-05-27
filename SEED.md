@@ -1,6 +1,6 @@
 # Purpose
 
-> See [[README#Purpose]].
+> See [README#Purpose](README.md#purpose).
 
 ## Normative Language
 
@@ -157,6 +157,82 @@ for target in "Plow" "Messages" "System Events"; do
 tell application "$target" to return name
 OSA
 done
+
+# 9. Auto-activation. Plow.app's onboarding posts /activate and polls
+#    /activate/redeem on its own — what's missing without operator
+#    intervention is the iMessage send of the activation code. The
+#    operator's iMessage account on this Mac is the implicit send-FROM;
+#    the send-TO number is whatever Plow.app's activation screen
+#    displays. We poll app.log for the displayed code, prompt the
+#    operator (tier-3 — only they can see the UI) for the send-TO
+#    number, drive Messages.app via the already-grant-warmed seedctl
+#    TCC principal, then wait for plow-api-token to land. The token's
+#    presence at mode 600 is the SEED's source of truth for "Plow is
+#    activated" — downstream SEEDs that POST to plowd's local API
+#    require this post-condition.
+APP_SUPPORT="$HOME/Library/Application Support/co.plow.app"
+APP_LOG="$APP_SUPPORT/app.log"
+TOKEN_FILE="$APP_SUPPORT/plow-api-token"
+
+# 9a. Skip the rest if Plow is already activated. Idempotency: re-runs
+#     on an already-activated machine MUST NOT re-trigger activation or
+#     prompt the operator. We treat the presence of a non-empty mode-600
+#     token file as canonical "activated" — same predicate ^v-activated
+#     asserts at the end.
+if [ -s "$TOKEN_FILE" ] && [ "$(stat -f '%Lp' "$TOKEN_FILE")" = "600" ]; then
+  echo "Plow already activated (token present at $TOKEN_FILE). Skipping activation." >&2
+else
+  # 9b. Wait for Plow.app to write its activation code to the app log.
+  #     Polling (not tail -F) — app.log can be replaced on app upgrade.
+  #     tail -1 picks the latest line in case a prior install attempt
+  #     left an expired code in the same log.
+  ACTIVATION_CODE=""
+  for _ in $(seq 1 60); do
+    ACTIVATION_CODE=$(grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null \
+                      | tail -1 \
+                      | sed 's/.*=//')
+    [ -n "$ACTIVATION_CODE" ] && break
+    sleep 2
+  done
+  [ -n "$ACTIVATION_CODE" ] || { echo "no activation code in 120s — check $APP_LOG" >&2; exit 1; }
+
+  # 9c. Prompt the operator for the send-TO number Plow.app's activation
+  #     UI displays. Tier-3 per the SEED convention — only the operator
+  #     can see the UI; we don't UI-scrape in v1. Read via /dev/tty so
+  #     the prompt works even when the SEED is piped via `seed install`.
+  echo "" >&2
+  echo "Plow's activation screen shows a number to text the code to." >&2
+  echo "Please type that number (e.g. +1XXXXXXXXXX), then press Enter:" >&2
+  read -r SEND_TO </dev/tty
+  [ -n "$SEND_TO" ] || { echo "no send-TO number supplied — aborting" >&2; exit 1; }
+
+  # 9d. Drive Messages.app via seedctl. Step 8 already pre-warmed the
+  #     Messages TCC grant so this won't prompt. iMessage service
+  #     explicitly — Plow's activation line is iMessage-only; an
+  #     SMS-defaulted send to a green-bubble peer would silently fail
+  #     server-side. The code+number pass via stdin (heredoc) — never on
+  #     argv (last-3-chars policy applies to argv visibility too).
+  "$SEEDCTL" osa --stdin <<OSA
+tell application "Messages"
+  set theService to first service whose service type = iMessage
+  set theBuddy to participant "$SEND_TO" of theService
+  send "$ACTIVATION_CODE" to theBuddy
+end tell
+OSA
+
+  # 9e. Poll for plow-api-token to appear at mode 600. Plow.app's own
+  #     /activate/redeem poll lands it once the inbound SMS matches.
+  TOKEN_LANDED=0
+  for _ in $(seq 1 60); do
+    if [ -s "$TOKEN_FILE" ] && [ "$(stat -f '%Lp' "$TOKEN_FILE")" = "600" ]; then
+      TOKEN_LANDED=1
+      break
+    fi
+    sleep 2
+  done
+  [ "$TOKEN_LANDED" = "1" ] || { echo "plow-api-token did not land within 120s — check Plow.app's activation screen and $APP_LOG" >&2; exit 1; }
+  echo "Plow activated. Token landed at $TOKEN_FILE." >&2
+fi
 ```
 
 ## Objects
@@ -203,6 +279,14 @@ done
 - These three targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation, and (c) System Events is the generic AppleScript surface for keystroke/window operations. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed in v1 — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
 - Pre-warm failures MUST abort the install. If the user clicks Don't Allow on any of the three prompts, the dummy `seedctl osa` call exits non-zero and the install fails — the user re-runs after granting. The previous `|| true` soft-fail semantics produced a silent success-with-missing-grants state where downstream SEEDs would rediscover the missing TCC mid-flight, exactly the silent-failure class this SEED exists to eliminate. AppleEvents to a just-launched app queue until the app is ready, so a slow Plow boot is not a transient-failure concern that justifies a `|| true`.
 
+### Plow is activated ^act-activate
+
+- After [`^act-prewarm`](#^act-prewarm), the install reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
+- Two 120-second polls (60 × 2s each): one for the `app.log` `Activation created` line, one for the token file. Either timing out aborts the install. Downstream SEEDs that POST to plowd's local API require `^v-activated`; silent partial-activation would surface as a mid-flight crash in those SEEDs — exactly the failure class this Action exists to eliminate.
+- The Messages.app `send` AppleScript MUST be routed through `seedctl osa --stdin` (the heredoc on stdin keeps the activation code off argv). It MUST be sent over the iMessage service explicitly (`first service whose service type = iMessage`); Plow's activation line is iMessage-only and an SMS-defaulted send would silently fail server-side even though Messages.app shows it as delivered.
+- The `send_to` prompt is the only operator input this Action collects. The operator's iMessage identity on this Mac is the implicit send-FROM (whatever Messages.app has configured); no SEED-side handle prompt is needed.
+- Idempotent: a pre-existing non-empty mode-600 `plow-api-token` skips the entire activation phase. Re-running this SEED against an already-activated Mac MUST NOT re-prompt for the send_to number or re-drive Messages.app.
+
 ## Verify
 
 1. **seedctl is functional.** ^v-seedctl Does `"${SEEDCTL:-/Applications/Seed OS Manager.app/Contents/MacOS/seedctl}" osa --stdin <<<'return 1 + 1'` exit 0 and print `2`? This is `seed-os-manager`'s own `^v-smoke` re-asserted here as this SEED's hard dep — if it fails, every Apple Event in this install will also fail. Expected: yes.
@@ -210,6 +294,8 @@ done
 3. **Bundle is well-formed.** ^v-plist Does `defaults read /Applications/Plow.app/Contents/Info CFBundleIdentifier` print a non-empty bundle identifier (no error)? Expected: yes.
 4. **App launches.** ^v-launch Does `open -a Plow` exit 0, and does `pgrep -x Plow` report at least one running process within 10 seconds? Expected: yes.
 5. **Quarantine is stripped.** ^v-no-quarantine Does `xattr -p com.apple.quarantine /Applications/Plow.app` exit non-zero (i.e., the xattr is not present)? If the quarantine xattr is still set, the install's `^act-replace` xattr strip was a no-op and Gatekeeper will still show its "downloaded from Internet" dialog on first user launch — which is exactly what `^act-replace` exists to prevent. Expected: yes (non-zero exit).
+
+6. **Plow is activated.** ^v-activated Does `~/Library/Application Support/co.plow.app/plow-api-token` exist with mode `600` and non-zero size? If the token is absent, `^act-activate` either timed out (the operator missed Plow's activation screen) or never ran (a corrupted earlier install left an empty token file) — every downstream SEED that POSTs to plowd's local API will then fail with a missing-bearer error. Expected: yes (file present, mode 600, non-empty).
 
 ## Open
 
