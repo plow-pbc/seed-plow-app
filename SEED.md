@@ -77,11 +77,26 @@ if [ ! -x "$SEEDCTL" ]; then
   rmdir "$SOM_MOUNT" 2>/dev/null || true
   SOM_MOUNT=""
 fi
-# Smoke test runs UNCONDITIONALLY (not only inside the install branch). On a
-# retry where seedctl is already executable but corrupted, the install branch
-# above would be skipped — without an unconditional smoke test we would proceed
-# treating a broken TCC principal as usable.
+# Identity verification + smoke test run UNCONDITIONALLY (not only inside
+# the install branch). On a retry where seedctl is already executable —
+# or worse, where the operator set SEEDCTL to a different binary via env
+# var — the install branch above is skipped, so the only guard on the
+# binary that later receives the live `Plow Activate: $ACTIVATION_CODE`
+# heredoc would be the `1+1` smoke test. That's not enough: any binary
+# accepting stdin and printing `2` would pass it. Verify the bundle
+# identity matches `Identifier=co.plow.seed-os-manager` + the pinned
+# TeamIdentifier — same contract the fresh-install branch enforces
+# above. The resolved $SEEDCTL is `<bundle>/Contents/MacOS/seedctl`; the
+# bundle is two dir-levels up.
 [ -x "$SEEDCTL" ] || { echo "seedctl not found at $SEEDCTL after seed-os-manager install" >&2; exit 1; }
+SEEDCTL_BUNDLE="$(cd "$(dirname "$SEEDCTL")/../.." && pwd)"
+codesign --verify --deep --strict --verbose=0 "$SEEDCTL_BUNDLE" \
+  || { echo "$SEEDCTL_BUNDLE: codesign verify failed — refusing to drive Apple Events through it" >&2; exit 1; }
+SEEDCTL_META=$(codesign -d --verbose=2 "$SEEDCTL_BUNDLE" 2>&1)
+echo "$SEEDCTL_META" | grep -qx 'Identifier=co.plow.seed-os-manager' \
+  || { echo "$SEEDCTL_BUNDLE: Identifier mismatch (expected co.plow.seed-os-manager). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
+echo "$SEEDCTL_META" | grep -qx 'TeamIdentifier=3559PD337Z' \
+  || { echo "$SEEDCTL_BUNDLE: TeamIdentifier mismatch (expected 3559PD337Z). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
 test "$("$SEEDCTL" osa --stdin <<<'return 1 + 1')" = "2" || { echo "seedctl smoke test failed (return 1+1 did not produce 2). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
 
 # 1. Download the latest production Plow.dmg.
@@ -142,25 +157,30 @@ ditto "$PLOW_MOUNT/Plow.app" /Applications/Plow.app
 #    bundle's signature + Gatekeeper acceptance locally.
 xattr -cr /Applications/Plow.app
 
-# 7. Snapshot the latest pre-launch activation code from app.log (if
-#    any) BEFORE re-launching. The 9b poll uses this to wait for a
-#    NEW code rather than picking the most recent historical one — on
-#    a retry, app.log already contains expired Activation lines from
-#    earlier sessions, and `tail -1` alone would send a stale code
-#    that the backend rejects.
-APP_LOG_PRELAUNCH="$HOME/Library/Application Support/co.plow.app/app.log"
-PRE_LAUNCH_CODE=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG_PRELAUNCH" 2>/dev/null || true; } | tail -1 | sed 's/.*=//')
+# 7. Hoist the activation paths now — step 9b's poll uses the same
+#    APP_LOG, and a single source of truth keeps the next edit honest.
+APP_SUPPORT="$HOME/Library/Application Support/co.plow.app"
+APP_LOG="$APP_SUPPORT/app.log"
+TOKEN_FILE="$APP_SUPPORT/plow-api-token"
+
+# 7a. Snapshot the latest pre-launch activation code from app.log (if
+#     any) BEFORE re-launching. The 9b poll uses this to wait for a
+#     NEW code rather than picking the most recent historical one — on
+#     a retry, app.log already contains expired Activation lines from
+#     earlier sessions, and `tail -1` alone would send a stale code
+#     that the backend rejects.
+PRE_LAUNCH_CODE=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null || true; } | tail -1 | sed 's/.*=//')
 
 # 7b. Launch the new build.
 open -a Plow
 
 # 8. Pre-warm Automation TCC for common downstream targets. Fail-loud: a Don't
-#    Allow click on any of the three prompts (Plow, Messages, System Events)
-#    aborts the install. Re-run after granting. The previous behavior of
-#    `|| true` made the install silently succeed with missing grants — exactly
-#    the silent-failure class this PR exists to eliminate. AppleEvents to
-#    just-launched apps queue until the app is ready, so a slow Plow launch
-#    isn't a transient-failure concern.
+#    Allow click on either prompt (Plow, Messages) aborts the install. Re-run
+#    after granting. The previous behavior of `|| true` made the install
+#    silently succeed with missing grants — exactly the silent-failure class
+#    this PR exists to eliminate. AppleEvents to just-launched apps queue
+#    until the app is ready, so a slow Plow launch isn't a transient-failure
+#    concern.
 for target in "Plow" "Messages"; do
   "$SEEDCTL" osa --stdin <<OSA
 tell application "$target" to return name
@@ -172,16 +192,14 @@ done
 #    intervention is the iMessage send of the activation code. The
 #    operator's iMessage account on this Mac is the implicit send-FROM;
 #    the send-TO number is whatever Plow.app's activation screen
-#    displays. We poll app.log for the displayed code, prompt the
-#    operator (tier-3 — only they can see the UI) for the send-TO
-#    number, drive Messages.app via the already-grant-warmed seedctl
-#    TCC principal, then wait for plow-api-token to land. The token's
-#    presence at mode 600 is the SEED's source of truth for "Plow is
-#    activated" — downstream SEEDs that POST to plowd's local API
-#    require this post-condition.
-APP_SUPPORT="$HOME/Library/Application Support/co.plow.app"
-APP_LOG="$APP_SUPPORT/app.log"
-TOKEN_FILE="$APP_SUPPORT/plow-api-token"
+#    displays. We poll app.log for the displayed code (against the
+#    PRE_LAUNCH_CODE snapshot from step 7a — only a fresh, post-launch
+#    code triggers the send), prompt the operator (tier-3 — only they
+#    can see the UI) for the send-TO number, drive Messages.app via
+#    the already-grant-warmed seedctl TCC principal, then wait for
+#    plow-api-token to land. The token's presence at mode 600 is the
+#    SEED's source of truth for "Plow is activated" — downstream SEEDs
+#    that POST to plowd's local API require this post-condition.
 
 # 9a. Skip the rest if Plow is already activated. Idempotency: re-runs
 #     on an already-activated machine MUST NOT re-trigger activation or
@@ -302,7 +320,7 @@ fi
 
 - Immediately after launching the new build, the install fires two dummy `seedctl osa` calls at `"Plow"` and `"Messages"`. Each call triggers a one-time macOS Automation TCC prompt attributed to "Seed OS Manager"; the user clicks Allow once per target. Grants are durable across reboots and SEED reinstalls.
 - These two targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation (and is what `^act-activate` drives below). System Events is NOT pre-warmed in v1 — there's no in-repo consumer; if a future SEED needs it, the first call will surface the TCC prompt naturally. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed either — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
-- Pre-warm failures MUST abort the install. If the user clicks Don't Allow on any of the three prompts, the dummy `seedctl osa` call exits non-zero and the install fails — the user re-runs after granting. The previous `|| true` soft-fail semantics produced a silent success-with-missing-grants state where downstream SEEDs would rediscover the missing TCC mid-flight, exactly the silent-failure class this SEED exists to eliminate. AppleEvents to a just-launched app queue until the app is ready, so a slow Plow boot is not a transient-failure concern that justifies a `|| true`.
+- Pre-warm failures MUST abort the install. If the user clicks Don't Allow on either prompt, the dummy `seedctl osa` call exits non-zero and the install fails — the user re-runs after granting. The previous `|| true` soft-fail semantics produced a silent success-with-missing-grants state where downstream SEEDs would rediscover the missing TCC mid-flight, exactly the silent-failure class this SEED exists to eliminate. AppleEvents to a just-launched app queue until the app is ready, so a slow Plow boot is not a transient-failure concern that justifies a `|| true`.
 
 ### Plow is activated ^act-activate
 
