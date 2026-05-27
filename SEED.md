@@ -185,10 +185,12 @@ else
   # 9b. Wait for Plow.app to write its activation code to the app log.
   #     Polling (not tail -F) — app.log can be replaced on app upgrade.
   #     tail -1 picks the latest line in case a prior install attempt
-  #     left an expired code in the same log.
+  #     left an expired code in the same log. The `|| true` keeps a
+  #     grep no-match (the common case on early poll ticks) from
+  #     killing the loop under set -euo pipefail.
   ACTIVATION_CODE=""
   for _ in $(seq 1 60); do
-    ACTIVATION_CODE=$(grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null \
+    ACTIVATION_CODE=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null || true; } \
                       | tail -1 \
                       | sed 's/.*=//')
     [ -n "$ACTIVATION_CODE" ] && break
@@ -207,9 +209,8 @@ else
   echo "Plow's activation screen shows a number to text the code to." >&2
   echo "Please type that number in E.164 form (e.g. +14155551234), then press Enter:" >&2
   read -r SEND_TO </dev/tty
-  [ -n "$SEND_TO" ] || { echo "no send-TO number supplied — aborting" >&2; exit 1; }
   echo "$SEND_TO" | grep -Eq '^\+[0-9]{10,15}$' \
-    || { echo "send-TO not in E.164 form (expected +<10-15 digits>): $SEND_TO" >&2; exit 1; }
+    || { echo "send-TO not in E.164 form (expected +<10-15 digits>): '$SEND_TO'" >&2; exit 1; }
 
   # 9d. Drive Messages.app via seedctl. Step 8 already pre-warmed the
   #     Messages TCC grant so this won't prompt. iMessage service
