@@ -142,7 +142,16 @@ ditto "$PLOW_MOUNT/Plow.app" /Applications/Plow.app
 #    bundle's signature + Gatekeeper acceptance locally.
 xattr -cr /Applications/Plow.app
 
-# 7. Launch the new build.
+# 7. Snapshot the latest pre-launch activation code from app.log (if
+#    any) BEFORE re-launching. The 9b poll uses this to wait for a
+#    NEW code rather than picking the most recent historical one — on
+#    a retry, app.log already contains expired Activation lines from
+#    earlier sessions, and `tail -1` alone would send a stale code
+#    that the backend rejects.
+APP_LOG_PRELAUNCH="$HOME/Library/Application Support/co.plow.app/app.log"
+PRE_LAUNCH_CODE=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG_PRELAUNCH" 2>/dev/null || true; } | tail -1 | sed 's/.*=//')
+
+# 7b. Launch the new build.
 open -a Plow
 
 # 8. Pre-warm Automation TCC for common downstream targets. Fail-loud: a Don't
@@ -152,7 +161,7 @@ open -a Plow
 #    the silent-failure class this PR exists to eliminate. AppleEvents to
 #    just-launched apps queue until the app is ready, so a slow Plow launch
 #    isn't a transient-failure concern.
-for target in "Plow" "Messages" "System Events"; do
+for target in "Plow" "Messages"; do
   "$SEEDCTL" osa --stdin <<OSA
 tell application "$target" to return name
 OSA
@@ -182,21 +191,27 @@ TOKEN_FILE="$APP_SUPPORT/plow-api-token"
 if [ -s "$TOKEN_FILE" ] && [ "$(stat -f '%Lp' "$TOKEN_FILE")" = "600" ]; then
   echo "Plow already activated (token present at $TOKEN_FILE). Skipping activation." >&2
 else
-  # 9b. Wait for Plow.app to write its activation code to the app log.
-  #     Polling (not tail -F) — app.log can be replaced on app upgrade.
-  #     tail -1 picks the latest line in case a prior install attempt
-  #     left an expired code in the same log. The `|| true` keeps a
-  #     grep no-match (the common case on early poll ticks) from
-  #     killing the loop under set -euo pipefail.
+  # 9b. Wait for Plow.app to write a NEW activation code to the app
+  #     log. Polling (not tail -F) — app.log can be replaced on app
+  #     upgrade. The `|| true` keeps a grep no-match (the common case
+  #     on early poll ticks) from killing the loop under set -euo
+  #     pipefail. The `!= PRE_LAUNCH_CODE` guard means a retry of the
+  #     install — where app.log already contains an expired code from
+  #     a prior session — waits for the freshly-launched app to write
+  #     its current code instead of picking up the stale `tail -1`
+  #     match and sending an expired code the backend would reject.
   ACTIVATION_CODE=""
   for _ in $(seq 1 60); do
-    ACTIVATION_CODE=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null || true; } \
-                      | tail -1 \
-                      | sed 's/.*=//')
-    [ -n "$ACTIVATION_CODE" ] && break
+    LATEST=$({ grep -oE 'Activation created: code=[A-Z0-9]+' "$APP_LOG" 2>/dev/null || true; } \
+             | tail -1 \
+             | sed 's/.*=//')
+    if [ -n "$LATEST" ] && [ "$LATEST" != "$PRE_LAUNCH_CODE" ]; then
+      ACTIVATION_CODE="$LATEST"
+      break
+    fi
     sleep 2
   done
-  [ -n "$ACTIVATION_CODE" ] || { echo "no activation code in 120s — check $APP_LOG" >&2; exit 1; }
+  [ -n "$ACTIVATION_CODE" ] || { echo "no new activation code in 120s — check $APP_LOG" >&2; exit 1; }
 
   # 9c. Prompt the operator for the send-TO number Plow.app's activation
   #     UI displays. Tier-3 per the SEED convention — only the operator
@@ -285,8 +300,8 @@ fi
 
 ### Automation TCC is pre-warmed ^act-prewarm
 
-- Immediately after launching the new build, the install fires three dummy `seedctl osa` calls at `"Plow"`, `"Messages"`, and `"System Events"`. Each call triggers a one-time macOS Automation TCC prompt attributed to "Seed OS Manager"; the user clicks Allow once per target. Grants are durable across reboots and SEED reinstalls.
-- These three targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation, and (c) System Events is the generic AppleScript surface for keystroke/window operations. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed in v1 — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
+- Immediately after launching the new build, the install fires two dummy `seedctl osa` calls at `"Plow"` and `"Messages"`. Each call triggers a one-time macOS Automation TCC prompt attributed to "Seed OS Manager"; the user clicks Allow once per target. Grants are durable across reboots and SEED reinstalls.
+- These two targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation (and is what `^act-activate` drives below). System Events is NOT pre-warmed in v1 — there's no in-repo consumer; if a future SEED needs it, the first call will surface the TCC prompt naturally. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed either — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
 - Pre-warm failures MUST abort the install. If the user clicks Don't Allow on any of the three prompts, the dummy `seedctl osa` call exits non-zero and the install fails — the user re-runs after granting. The previous `|| true` soft-fail semantics produced a silent success-with-missing-grants state where downstream SEEDs would rediscover the missing TCC mid-flight, exactly the silent-failure class this SEED exists to eliminate. AppleEvents to a just-launched app queue until the app is ready, so a slow Plow boot is not a transient-failure concern that justifies a `|| true`.
 
 ### Plow is activated ^act-activate
