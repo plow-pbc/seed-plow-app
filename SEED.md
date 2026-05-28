@@ -36,6 +36,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Identity verification helper — used at the three bundle-trust points
+# below (seed-os-manager DMG, Plow DMG, and the resolved seedctl bundle
+# on the override path). Three repetitions is the rule-of-3 trigger;
+# one helper keeps the codesign + spctl + Identifier + TeamIdentifier
+# contract from drifting across sites the next time signing policy
+# changes.
+verify_bundle_identity() {
+  local bundle="$1" want_id="$2" want_team="$3"
+  codesign --verify --deep --strict --verbose=0 "$bundle" \
+    || { echo "$bundle: codesign verify failed" >&2; exit 1; }
+  spctl --assess --type execute "$bundle" \
+    || { echo "$bundle: Gatekeeper/notarization assessment failed" >&2; exit 1; }
+  local meta
+  meta=$(codesign -d --verbose=2 "$bundle" 2>&1)
+  echo "$meta" | grep -qx "Identifier=$want_id" \
+    || { echo "$bundle: Identifier mismatch (expected $want_id)" >&2; exit 1; }
+  echo "$meta" | grep -qx "TeamIdentifier=$want_team" \
+    || { echo "$bundle: TeamIdentifier mismatch (expected $want_team)" >&2; exit 1; }
+}
+
 # 0. Chain in seed-os-manager (signed TCC principal for Apple Events).
 #    Idempotent: skips the install when seedctl is already executable. Inlines
 #    seed-os-manager's install block rather than `curl | bash`-ing a standalone
@@ -61,13 +81,7 @@ if [ ! -x "$SEEDCTL" ]; then
   # macOS accepts the bundle as notarized; the Identifier + TeamIdentifier
   # grep proves the bundle is *this product*, not some other Apple-signed
   # app shaped like Seed OS Manager.app.
-  codesign --verify --deep --strict --verbose=0 "$SOM_MOUNT/Seed OS Manager.app"
-  spctl --assess --type execute "$SOM_MOUNT/Seed OS Manager.app"
-  SOM_META=$(codesign -d --verbose=2 "$SOM_MOUNT/Seed OS Manager.app" 2>&1)
-  echo "$SOM_META" | grep -qx 'Identifier=co.plow.seed-os-manager' \
-    || { echo "Seed OS Manager.app: Identifier mismatch (expected co.plow.seed-os-manager)" >&2; exit 1; }
-  echo "$SOM_META" | grep -qx 'TeamIdentifier=3559PD337Z' \
-    || { echo "Seed OS Manager.app: TeamIdentifier mismatch (expected 3559PD337Z)" >&2; exit 1; }
+  verify_bundle_identity "$SOM_MOUNT/Seed OS Manager.app" "co.plow.seed-os-manager" "3559PD337Z"
   rm -rf "$SOM_APP"
   # ditto (not cp -R): BSD cp -R nests source-into-existing-dest, producing
   # /Applications/Seed OS Manager.app/Seed OS Manager.app on retry. Mirrors
@@ -90,15 +104,7 @@ fi
 # bundle is two dir-levels up.
 [ -x "$SEEDCTL" ] || { echo "seedctl not found at $SEEDCTL after seed-os-manager install" >&2; exit 1; }
 SEEDCTL_BUNDLE="$(cd "$(dirname "$SEEDCTL")/../.." && pwd)"
-codesign --verify --deep --strict --verbose=0 "$SEEDCTL_BUNDLE" \
-  || { echo "$SEEDCTL_BUNDLE: codesign verify failed — refusing to drive Apple Events through it" >&2; exit 1; }
-spctl --assess --type execute "$SEEDCTL_BUNDLE" \
-  || { echo "$SEEDCTL_BUNDLE: Gatekeeper/notarization assessment failed — refusing to drive Apple Events through it" >&2; exit 1; }
-SEEDCTL_META=$(codesign -d --verbose=2 "$SEEDCTL_BUNDLE" 2>&1)
-echo "$SEEDCTL_META" | grep -qx 'Identifier=co.plow.seed-os-manager' \
-  || { echo "$SEEDCTL_BUNDLE: Identifier mismatch (expected co.plow.seed-os-manager). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
-echo "$SEEDCTL_META" | grep -qx 'TeamIdentifier=3559PD337Z' \
-  || { echo "$SEEDCTL_BUNDLE: TeamIdentifier mismatch (expected 3559PD337Z). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
+verify_bundle_identity "$SEEDCTL_BUNDLE" "co.plow.seed-os-manager" "3559PD337Z"
 test "$("$SEEDCTL" osa --stdin <<<'return 1 + 1')" = "2" || { echo "seedctl smoke test failed (return 1+1 did not produce 2). Reinstall https://github.com/plow-pbc/seed-os-manager." >&2; exit 1; }
 
 # 1. Download the latest production Plow.dmg.
@@ -138,13 +144,7 @@ hdiutil attach -nobrowse -readonly -mountpoint "$PLOW_MOUNT" "$DMG" >/dev/null
 #    local notarization + signing checks on the downloaded bundle. The
 #    Identifier + TeamIdentifier grep proves the bundle is *this product*,
 #    not just any Apple-signed app shaped like Plow.app.
-codesign --verify --deep --strict --verbose=0 "$PLOW_MOUNT/Plow.app"
-spctl --assess --type execute "$PLOW_MOUNT/Plow.app"
-PLOW_META=$(codesign -d --verbose=2 "$PLOW_MOUNT/Plow.app" 2>&1)
-echo "$PLOW_META" | grep -qx 'Identifier=co.plow.app' \
-  || { echo "Plow.app: Identifier mismatch (expected co.plow.app)" >&2; exit 1; }
-echo "$PLOW_META" | grep -qx 'TeamIdentifier=KLP7XF8JXJ' \
-  || { echo "Plow.app: TeamIdentifier mismatch (expected KLP7XF8JXJ)" >&2; exit 1; }
+verify_bundle_identity "$PLOW_MOUNT/Plow.app" "co.plow.app" "KLP7XF8JXJ"
 
 # 5. Replace /Applications/Plow.app. ditto (not cp -R) for the same reason as
 #    the seed-os-manager copy above.
@@ -224,10 +224,16 @@ else
   #      operator's click-then-watch round-trip.
   echo "" >&2
   echo "Plow.app should now be showing its installer / activation window." >&2
-  echo "  → Click 'Start' (or 'Activate' / 'Begin') in Plow's UI now to" >&2
-  echo "    trigger activation. Once you click, Plow writes the activation" >&2
-  echo "    code to its log; this install picks it up automatically and" >&2
-  echo "    drives Messages.app to send the iMessage for you." >&2
+  echo "  1. Click 'Start' (or 'Activate' / 'Begin') in Plow's UI." >&2
+  echo "  2. If Plow then asks for Full Disk Access (FDA), grant it" >&2
+  echo "     in System Settings → Privacy & Security → Full Disk" >&2
+  echo "     Access, then return to Plow's main flow. (Plow's" >&2
+  echo "     InstallerView guards startActivation() behind FDA — on" >&2
+  echo "     a fresh install without FDA, clicking Start routes you" >&2
+  echo "     to the FDA screen instead of starting activation.)" >&2
+  echo "  3. Once activation actually starts, Plow writes the code to" >&2
+  echo "     its log; this install picks it up automatically and drives" >&2
+  echo "     Messages.app to send the activation text for you." >&2
   echo "" >&2
 
   # 9b. Wait for Plow.app to write a NEW activation code to the app
@@ -267,20 +273,22 @@ else
     || { echo "send-TO not in E.164 form (expected +<10-15 digits>); please re-run and re-type the number" >&2; exit 1; }
 
   # 9d. Drive Messages.app via seedctl. Step 8 already pre-warmed the
-  #     Messages TCC grant so this won't prompt. iMessage service
-  #     explicitly — Plow's activation line is iMessage-only; an
-  #     SMS-defaulted send to a green-bubble peer would silently fail
-  #     server-side. The code+number pass via stdin (heredoc) — never on
-  #     argv (last-3-chars policy applies to argv visibility too). The
+  #     Messages TCC grant so this won't prompt. The send target is
+  #     `buddy "$SEND_TO"` (NOT a service-scoped participant) so
+  #     Messages routes naturally — iMessage when the number is
+  #     registered, SMS via paired-iPhone Text Message Forwarding
+  #     otherwise. Plow's canonical activation receiver is the LINQ
+  #     SMS inbound webhook (api/plow/channels/linq/routes/webhook.py
+  #     matches '^Plow Activate:\s*(\S+)'), so forcing iMessage-only
+  #     would route the message away from Plow's receiver entirely.
+  #     The code+number pass via stdin (heredoc) — never on argv
+  #     (last-3-chars policy applies to argv visibility too). The
   #     'Plow Activate: ' prefix is required by the production inbound
-  #     parser (api/plow/channels/linq/routes/webhook.py matches on
-  #     '^Plow Activate:\s*(\S+)'); the bare code alone never matches
-  #     and the operator times out waiting for plow-api-token.
+  #     parser; the bare code alone never matches and the operator
+  #     times out waiting for plow-api-token.
   "$SEEDCTL" osa --stdin <<OSA
 tell application "Messages"
-  set theService to first service whose service type = iMessage
-  set theBuddy to participant "$SEND_TO" of theService
-  send "Plow Activate: $ACTIVATION_CODE" to theBuddy
+  send "Plow Activate: $ACTIVATION_CODE" to buddy "$SEND_TO"
 end tell
 OSA
 
@@ -345,9 +353,9 @@ fi
 
 ### Plow is activated ^act-activate
 
-- After [`^act-prewarm`](#^act-prewarm), the install surfaces a one-line instruction telling the operator to click Start / Activate / Begin in Plow.app's installer window — Plow's `InstallerView` initializes with `started=false`, so `prepareActivationIfNeeded()` never reaches `startActivation()` until the operator clicks. The install then reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
+- After [`^act-prewarm`](#^act-prewarm), the install surfaces a multi-step instruction telling the operator to (1) click Start / Activate / Begin in Plow.app's installer window, (2) grant Full Disk Access if Plow asks (`InstallerView` guards `startActivation()` behind `client.hasFullDiskAccess` — fresh installs without FDA route to the FDA screen instead of starting activation), then (3) return to Plow's main flow. Plow's `InstallerView` initializes with `started=false`, so `prepareActivationIfNeeded()` never reaches `startActivation()` until both the Start click AND FDA are satisfied. The install then reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
 - Two 120-second polls (60 × 2s each): one for the `app.log` `Activation created` line, one for the token file. Either timing out aborts the install. Downstream SEEDs that POST to plowd's local API require `^v-activated`; silent partial-activation would surface as a mid-flight crash in those SEEDs — exactly the failure class this Action exists to eliminate.
-- The Messages.app `send` AppleScript MUST be routed through `seedctl osa --stdin` (the heredoc on stdin keeps the activation code off argv). It MUST be sent over the iMessage service explicitly (`first service whose service type = iMessage`); Plow's activation line is iMessage-only and an SMS-defaulted send would silently fail server-side even though Messages.app shows it as delivered.
+- The Messages.app `send` AppleScript MUST be routed through `seedctl osa --stdin` (the heredoc on stdin keeps the activation code off argv). It MUST target `buddy "$SEND_TO"` (NOT a service-scoped participant) so Messages.app routes naturally — iMessage when the number is registered, SMS via paired-iPhone Text Message Forwarding otherwise. Plow's canonical activation receiver is the LINQ SMS inbound webhook; forcing iMessage-only would route the message away from Plow's receiver entirely.
 - The `send_to` prompt is the only operator input this Action collects. The operator's iMessage identity on this Mac is the implicit send-FROM (whatever Messages.app has configured); no SEED-side handle prompt is needed.
 - Idempotent: a pre-existing non-empty mode-600 `plow-api-token` skips the entire activation phase. Re-running this SEED against an already-activated Mac MUST NOT re-prompt for the send_to number or re-drive Messages.app.
 
