@@ -206,8 +206,8 @@ done
 # 9a. Skip the rest if Plow is already activated. Idempotency: re-runs
 #     on an already-activated machine MUST NOT re-trigger activation or
 #     prompt the operator. We treat the presence of a non-empty mode-600
-#     token file as canonical "activated" — same predicate ^v-activated
-#     asserts at the end.
+#     token file as canonical "activated" — same predicate the
+#     "Plow is activated" Verify check asserts at the end.
 if [ -s "$TOKEN_FILE" ] && [ "$(stat -f '%Lp' "$TOKEN_FILE")" = "600" ]; then
   echo "Plow already activated (token present at $TOKEN_FILE). Skipping activation." >&2
 else
@@ -309,30 +309,30 @@ fi
 
 ## Objects
 
-### Plow.app ^obj-app
+### Plow.app
 
 - The installed application bundle at `/Applications/Plow.app`.
 - Owned by the installing user. The presence and launchability of this bundle is the SEED's single source of truth for "Plow is installed."
 
-### Plow.dmg ^obj-dmg
+### Plow.dmg
 
 - The signed, notarized disk image served at `https://plow.co/download` (currently redirects to `https://s3.us-west-2.amazonaws.com/releases.plow.co/Plow.dmg`).
 - Single canonical "latest" URL — no version embedded in the path. The artifact at this URL is whatever Plow has shipped as production.
 
 ## Actions
 
-### seed-os-manager is installed first ^act-prereq
+### seed-os-manager is installed first
 
 - Post-order traversal of the dependency tree installs `seed-os-manager` before this SEED's own steps run, so `seedctl` is present on disk before any Apple Event in this install fires.
 - The chain is implemented inline in this SEED's install block: a guarded inlined install runs only when `$SEEDCTL` is not already executable. Re-runs are no-ops once `seed-os-manager` is installed. Future cleanup: collapse the inlined ~20 lines to `curl … | bash` once `seed-os-manager` publishes a standalone install script.
 - The inlined install deliberately omits the `/usr/local/bin/seedctl` symlink that `seed-os-manager`'s standalone install creates. That step requires `sudo` and would break the autonomous install path; `seedctl` is invoked by absolute path (`$SEEDCTL`) throughout this SEED and downstream consumers.
 - Failure to install `seed-os-manager` MUST abort this SEED's install. Without `seedctl`, the pre-warm and the quit-Plow steps cannot route through the signed TCC principal, and the install degrades to the silent `-1743` failure mode this dep was added to eliminate.
 
-### Plow is downloaded ^act-download
+### Plow is downloaded
 
 - `curl` fetches `https://plow.co/download`, follows the 307 redirect, and writes the response body to `$TMPDIR/Plow.dmg`. The download MUST exit non-zero on any HTTP error (`curl -f`).
 
-### Plow.app is replaced ^act-replace
+### Plow.app is replaced
 
 - The install action MUST quit BOTH a running `Plow.app` AND any bundled `plowd` process before copying. `plowd` lives under `/Applications/Plow.app/...`; `rm -rf`'ing the bundle while `plowd` is still executing from it would leave a zombie running deleted-on-disk code until the next reboot. The quit pattern mirrors `cncorp/plow`'s `install-latest-production-build.sh`: routed quit first (lets the app save state), `pkill -x Plow` and `pkill -f '/Applications/Plow\.app/.*plowd\.main:app'` as backstops, then re-check both processes are gone before continuing.
 - The routed quit MUST go through `seedctl osa --stdin` (not `osascript -e` directly), because the install block runs under the agent's shell, which is not a TCC-grantable principal; raw `osascript` would silently fail with `-1743` on a fresh machine and the running Plow.app would never quit.
@@ -340,39 +340,39 @@ fi
 - The install action MUST `rm -rf /Applications/Plow.app` before `ditto`, so a stale build can never silently shadow the new one. `ditto` (not `cp -R`) prevents BSD `cp -R`'s nesting bug: `cp -R src/Plow.app /Applications/` would produce `/Applications/Plow.app/Plow.app/` when the destination already exists.
 - After the copy, the install action clears extended attributes on the freshly-installed bundle with `xattr -cr /Applications/Plow.app`. The bundle is already signed and notarized and was verified locally in the prior step; clearing xattrs strips `com.apple.quarantine` (which would otherwise trigger Gatekeeper's "downloaded from Internet" dialog on first user launch) while remaining idempotent on retry — `xattr -dr com.apple.quarantine` exits non-zero under `set -e` when the xattr is already absent.
 
-### Plow is launched ^act-launch
+### Plow is launched
 
 - After the copy, `open -a Plow` launches the freshly-installed build.
-- macOS Gatekeeper does NOT prompt on first launch when `^act-replace`'s quarantine strip has run, because the bundle no longer carries the `com.apple.quarantine` xattr that triggers the dialog.
+- macOS Gatekeeper does NOT prompt on first launch when the [replace action](#plowapp-is-replaced)'s quarantine strip has run, because the bundle no longer carries the `com.apple.quarantine` xattr that triggers the dialog.
 
-### Automation TCC is pre-warmed ^act-prewarm
+### Automation TCC is pre-warmed
 
 - Immediately after launching the new build, the install fires two dummy `seedctl osa` calls at `"Plow"` and `"Messages"`. Each call triggers a one-time macOS Automation TCC prompt attributed to "Seed OS Manager"; the user clicks Allow once per target. Grants are durable across reboots and SEED reinstalls.
-- These two targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation (and is what `^act-activate` drives below). System Events is NOT pre-warmed in v1 — there's no in-repo consumer; if a future SEED needs it, the first call will surface the TCC prompt naturally. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed either — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s `^o-perdata`).
+- These two targets are chosen because (a) Plow is the app this SEED installs and downstream SEEDs will need to quit/relaunch it, (b) Messages is the canonical kickoff channel used by every Plow SEED that orchestrates a chat conversation (and is what the [activate action](#plow-is-activated) drives below). System Events is NOT pre-warmed in v1 — there's no in-repo consumer; if a future SEED needs it, the first call will surface the TCC prompt naturally. Per-data-class targets (Calendar.app, Mail.app, Reminders, Contacts) are NOT pre-warmed either — those require entitlements `seed-os-manager` v1 does not declare (see `seed-os-manager`'s [per-data-class privacy entitlements](https://github.com/plow-pbc/seed-os-manager/blob/main/SEED.md#per-data-class-privacy-entitlements) Open note).
 - Pre-warm failures MUST abort the install. If the user clicks Don't Allow on either prompt, the dummy `seedctl osa` call exits non-zero and the install fails — the user re-runs after granting. The previous `|| true` soft-fail semantics produced a silent success-with-missing-grants state where downstream SEEDs would rediscover the missing TCC mid-flight, exactly the silent-failure class this SEED exists to eliminate. AppleEvents to a just-launched app queue until the app is ready, so a slow Plow boot is not a transient-failure concern that justifies a `|| true`.
 
-### Plow is activated ^act-activate
+### Plow is activated
 
-- After [`^act-prewarm`](#^act-prewarm), the install surfaces a multi-step instruction telling the operator to (1) click Start / Activate / Begin in Plow.app's installer window, (2) grant Full Disk Access if Plow asks (`InstallerView` guards `startActivation()` behind `client.hasFullDiskAccess` — fresh installs without FDA route to the FDA screen instead of starting activation), then (3) return to Plow's main flow. Plow's `InstallerView` initializes with `started=false`, so `prepareActivationIfNeeded()` never reaches `startActivation()` until both the Start click AND FDA are satisfied. The install then reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is `^v-activated`'s source of truth.
-- Two 120-second polls (60 × 2s each): one for the `app.log` `Activation created` line, one for the token file. Either timing out aborts the install. Downstream SEEDs that POST to plowd's local API require `^v-activated`; silent partial-activation would surface as a mid-flight crash in those SEEDs — exactly the failure class this Action exists to eliminate.
+- After the [pre-warm action](#automation-tcc-is-pre-warmed), the install surfaces a multi-step instruction telling the operator to (1) click Start / Activate / Begin in Plow.app's installer window, (2) grant Full Disk Access if Plow asks (`InstallerView` guards `startActivation()` behind `client.hasFullDiskAccess` — fresh installs without FDA route to the FDA screen instead of starting activation), then (3) return to Plow's main flow. Plow's `InstallerView` initializes with `started=false`, so `prepareActivationIfNeeded()` never reaches `startActivation()` until both the Start click AND FDA are satisfied. The install then reads the activation `display_code` from `app.log` (matching the line `Activation created: code=…`), prompts the operator for the `send_to` number Plow.app's activation screen displays (tier-3 per [Tier](https://github.com/plow-pbc/seed/blob/main/SEED.md#tier) — only the operator can see the UI), drives Messages.app via `seedctl osa` to send the code, then polls for `~/Library/Application Support/co.plow.app/plow-api-token` to appear with mode 600. The token's presence is the source of truth for the [Plow is activated Verify check](#verify).
+- Two 120-second polls (60 × 2s each): one for the `app.log` `Activation created` line, one for the token file. Either timing out aborts the install. Downstream SEEDs that POST to plowd's local API require the [Plow is activated Verify check](#verify) to hold; silent partial-activation would surface as a mid-flight crash in those SEEDs — exactly the failure class this Action exists to eliminate.
 - The Messages.app `send` AppleScript MUST be routed through `seedctl osa --stdin` (the heredoc on stdin keeps the activation code off argv). It MUST target `buddy "$SEND_TO"` (NOT a service-scoped participant) so Messages.app routes naturally — iMessage when the number is registered, SMS via paired-iPhone Text Message Forwarding otherwise. Plow's canonical activation receiver is the LINQ SMS inbound webhook; forcing iMessage-only would route the message away from Plow's receiver entirely.
 - The `send_to` prompt is the only operator input this Action collects. The operator's iMessage identity on this Mac is the implicit send-FROM (whatever Messages.app has configured); no SEED-side handle prompt is needed.
 - Idempotent: a pre-existing non-empty mode-600 `plow-api-token` skips the entire activation phase. Re-running this SEED against an already-activated Mac MUST NOT re-prompt for the send_to number or re-drive Messages.app.
 
 ## Verify
 
-1. **seedctl is functional.** ^v-seedctl Does `"${SEEDCTL:-/Applications/Seed OS Manager.app/Contents/MacOS/seedctl}" osa --stdin <<<'return 1 + 1'` exit 0 and print `2`? This is `seed-os-manager`'s own `^v-smoke` re-asserted here as this SEED's hard dep — if it fails, every Apple Event in this install will also fail. Expected: yes.
-2. **App bundle present.** ^v-bundle Does `/Applications/Plow.app` exist as a directory containing the `Contents/MacOS/Plow` executable? Expected: yes.
-3. **Bundle is well-formed.** ^v-plist Does `defaults read /Applications/Plow.app/Contents/Info CFBundleIdentifier` print a non-empty bundle identifier (no error)? Expected: yes.
-4. **App launches.** ^v-launch Does `open -a Plow` exit 0, and does `pgrep -x Plow` report at least one running process within 10 seconds? Expected: yes.
-5. **Quarantine is stripped.** ^v-no-quarantine Does `xattr -p com.apple.quarantine /Applications/Plow.app` exit non-zero (i.e., the xattr is not present)? If the quarantine xattr is still set, the install's `^act-replace` xattr strip was a no-op and Gatekeeper will still show its "downloaded from Internet" dialog on first user launch — which is exactly what `^act-replace` exists to prevent. Expected: yes (non-zero exit).
+1. **seedctl is functional.** Does `"${SEEDCTL:-/Applications/Seed OS Manager.app/Contents/MacOS/seedctl}" osa --stdin <<<'return 1 + 1'` exit 0 and print `2`? This is `seed-os-manager`'s own [smoke-test check](https://github.com/plow-pbc/seed-os-manager/blob/main/SEED.md#verify) re-asserted here as this SEED's hard dep — if it fails, every Apple Event in this install will also fail. Expected: yes.
+2. **App bundle present.** Does `/Applications/Plow.app` exist as a directory containing the `Contents/MacOS/Plow` executable? Expected: yes.
+3. **Bundle is well-formed.** Does `defaults read /Applications/Plow.app/Contents/Info CFBundleIdentifier` print a non-empty bundle identifier (no error)? Expected: yes.
+4. **App launches.** Does `open -a Plow` exit 0, and does `pgrep -x Plow` report at least one running process within 10 seconds? Expected: yes.
+5. **Quarantine is stripped.** Does `xattr -p com.apple.quarantine /Applications/Plow.app` exit non-zero (i.e., the xattr is not present)? If the quarantine xattr is still set, the install's [replace action](#plowapp-is-replaced) xattr strip was a no-op and Gatekeeper will still show its "downloaded from Internet" dialog on first user launch — which is exactly what the [replace action](#plowapp-is-replaced) exists to prevent. Expected: yes (non-zero exit).
 
-6. **Plow is activated.** ^v-activated Does `~/Library/Application Support/co.plow.app/plow-api-token` exist with mode `600` and non-zero size? If the token is absent, `^act-activate` either timed out (the operator missed Plow's activation screen) or never ran (a corrupted earlier install left an empty token file) — every downstream SEED that POSTs to plowd's local API will then fail with a missing-bearer error. Expected: yes (file present, mode 600, non-empty).
+6. **Plow is activated.** Does `~/Library/Application Support/co.plow.app/plow-api-token` exist with mode `600` and non-zero size? If the token is absent, the [activate action](#plow-is-activated) either timed out (the operator missed Plow's activation screen) or never ran (a corrupted earlier install left an empty token file) — every downstream SEED that POSTs to plowd's local API will then fail with a missing-bearer error. Expected: yes (file present, mode 600, non-empty).
 
 ## Open
 
-- The .dmg's universal-binary status (arm64 + x86_64) is not asserted by this SEED. Authored on arm64; Intel-Mac installs unverified. ^o-universal
-- No SHA / signature pin on the downloaded `.dmg`. The agent trusts plow.co's TLS chain plus macOS's notarization gate at launch. ^o-pin
+- The .dmg's universal-binary status (arm64 + x86_64) is not asserted by this SEED. Authored on arm64; Intel-Mac installs unverified.
+- No SHA / signature pin on the downloaded `.dmg`. The agent trusts plow.co's TLS chain plus macOS's notarization gate at launch.
 
 ## Non-Goals
 
